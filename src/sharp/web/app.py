@@ -1,184 +1,125 @@
-import sys
-from pathlib import Path
-import logging
-import shutil
-import tempfile
+import os
+import io
 import zipfile
-import io as python_io
 import base64
+import tempfile
+from pathlib import Path
 
-from fastapi import FastAPI, Request, UploadFile, File
-from fastapi.responses import HTMLResponse, StreamingResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
-from fastapi.templating import Jinja2Templates
-import torch
-import numpy as np
+import requests
+import gradio as gr
 
-# Add src to path so we can import sharp
-sys.path.append(str(Path(__file__).parent.parent / "src"))
+# Front-end Gradio app that calls the backend FastAPI service hosted on GPU cloud.
+# Configure the backend base URL through environment variable on Hugging Face Spaces.
+# Example: API_BASE_URL = "https://your-api.example.com"
+API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
 
-from sharp.models import (
-    PredictorParams,
-    RGBGaussianPredictor,
-    create_predictor,
-)
-from sharp.utils import io as sharp_io
-from sharp.utils.gaussians import save_ply
-from sharp.cli.predict import predict_image, DEFAULT_MODEL_URL
 
-# Configure logging
-logging.basicConfig(level=logging.INFO)
-LOGGER = logging.getLogger(__name__)
+def _files_payload(images):
+    """Prepare multipart/form-data payload for requests.post(files=...)."""
+    files = []
+    for img in images:
+        if img is None:
+            continue
+        # gr.Image(type="filepath") returns a string path
+        if isinstance(img, str):
+            path = img
+            files.append(("files", (Path(path).name, open(path, "rb"), "image/*")))
+            continue
+        # gr.File returns objects with a .name attribute (path), or dict-like in some cases
+        path = getattr(img, "name", None)
+        if path is None and isinstance(img, dict) and "name" in img:
+            path = img["name"]
+        if path:
+            files.append(("files", (Path(path).name, open(path, "rb"), "image/*")))
+    return files
 
-app = FastAPI()
 
-# Mount static files if needed (we created the dir)
-app.mount("/static", StaticFiles(directory=Path(__file__).parent / "static"), name="static")
+def predict_single(image):
+    """Call /predict on backend for a single image and return one PLY file to download."""
+    if not image:
+        return None, "No image provided."
+    files = _files_payload([image])
+    if not files:
+        return None, "Invalid image input."
 
-templates = Jinja2Templates(directory=Path(__file__).parent / "templates")
-
-# Global variables for the model
-predictor: RGBGaussianPredictor = None
-device: torch.device = None
-
-@app.on_event("startup")
-async def startup_event():
-    global predictor, device
-    
-    # Determine device
-    if torch.cuda.is_available():
-        device_str = "cuda"
-    elif torch.mps.is_available():
-        device_str = "mps"
-    else:
-        device_str = "cpu"
-    
-    device = torch.device(device_str)
-    LOGGER.info(f"Using device: {device}")
-
-    # Load model
-    LOGGER.info("Loading model...")
     try:
-        # Try to load from cache or download
-        state_dict = torch.hub.load_state_dict_from_url(DEFAULT_MODEL_URL, progress=True, map_location=device)
-        
-        predictor = create_predictor(PredictorParams())
-        predictor.load_state_dict(state_dict)
-        predictor.eval()
-        predictor.to(device)
-        LOGGER.info("Model loaded successfully.")
+        resp = requests.post(f"{API_BASE_URL}/predict", files=files, timeout=120)
+        resp.raise_for_status()
+        data = resp.json()
     except Exception as e:
-        LOGGER.error(f"Failed to load model: {e}")
-        raise e
+        return None, f"Backend error: {e}"
 
-@app.get("/", response_class=HTMLResponse)
-async def read_root(request: Request):
-    return templates.TemplateResponse("index.html", {"request": request})
+    results = data.get("results", [])
+    if not results:
+        return None, "No result."
+    item = results[0]
+    if "error" in item:
+        return None, item["error"]
 
-@app.post("/predict")
-async def predict(files: list[UploadFile] = File(...)):
-    """Process images and return PLY data for viewing or download."""
-    if not predictor:
-        return JSONResponse({"error": "Model not loaded"}, status_code=500)
+    # Decode base64 PLY to a temporary file
+    ply_bytes = base64.b64decode(item["ply_data"])
+    with tempfile.NamedTemporaryFile(suffix=".ply", delete=False) as tmpf:
+        tmpf.write(ply_bytes)
+        ply_path = tmpf.name
 
-    # Create a temporary directory to process files
-    with tempfile.TemporaryDirectory() as temp_dir:
-        temp_path = Path(temp_dir)
-        results = []
-        
-        for file in files:
-            try:
-                # Save uploaded file
-                file_path = temp_path / file.filename
-                with open(file_path, "wb") as buffer:
-                    shutil.copyfileobj(file.file, buffer)
-                
-                LOGGER.info(f"Processing {file.filename}")
-                
-                # Load image using sharp's IO to get focal length and handle rotation
-                image, _, f_px = sharp_io.load_rgb(file_path)
-                
-                # Run prediction
-                gaussians = predict_image(predictor, image, f_px, device)
-                
-                # Save PLY
-                ply_filename = f"{file_path.stem}.ply"
-                ply_path = temp_path / ply_filename
-                
-                height, width = image.shape[:2]
-                save_ply(gaussians, f_px, (height, width), ply_path)
-                
-                # Read PLY file and encode as base64
-                with open(ply_path, "rb") as f:
-                    ply_data = base64.b64encode(f.read()).decode("utf-8")
-                
-                results.append({
-                    "filename": file.filename,
-                    "ply_filename": ply_filename,
-                    "ply_data": ply_data,
-                    "width": width,
-                    "height": height,
-                    "focal_length": f_px,
-                })
-                
-            except Exception as e:
-                LOGGER.error(f"Error processing {file.filename}: {e}")
-                results.append({
-                    "filename": file.filename,
-                    "error": str(e),
-                })
-        
-        return JSONResponse({"results": results})
+    meta = f"{item['ply_filename']} ({item['width']}x{item['height']}), f={item['focal_length']:.2f}"
+    return ply_path, meta
 
 
-@app.post("/predict/download")
-async def predict_download(files: list[UploadFile] = File(...)):
-    """Process images and return a ZIP file for download."""
-    if not predictor:
-        return HTMLResponse("Model not loaded", status_code=500)
+def predict_batch(images):
+    """Call /predict on backend for multiple images and return a ZIP of PLY files."""
+    if not images:
+        return None, "No images provided."
+    files = _files_payload(images)
+    if not files:
+        return None, "Invalid inputs."
 
-    # Create a temporary directory to process files
-    with tempfile.TemporaryDirectory() as temp_dir:
-        temp_path = Path(temp_dir)
-        output_zip = python_io.BytesIO()
-        
-        with zipfile.ZipFile(output_zip, "w") as zf:
-            for file in files:
-                try:
-                    # Save uploaded file
-                    file_path = temp_path / file.filename
-                    with open(file_path, "wb") as buffer:
-                        shutil.copyfileobj(file.file, buffer)
-                    
-                    LOGGER.info(f"Processing {file.filename}")
-                    
-                    # Load image using sharp's IO to get focal length and handle rotation
-                    image, _, f_px = sharp_io.load_rgb(file_path)
-                    
-                    # Run prediction
-                    gaussians = predict_image(predictor, image, f_px, device)
-                    
-                    # Save PLY
-                    ply_filename = f"{file_path.stem}.ply"
-                    ply_path = temp_path / ply_filename
-                    
-                    height, width = image.shape[:2]
-                    save_ply(gaussians, f_px, (height, width), ply_path)
-                    
-                    # Add to zip
-                    zf.write(ply_path, ply_filename)
-                    
-                except Exception as e:
-                    LOGGER.error(f"Error processing {file.filename}: {e}")
-                    continue
-        
-        output_zip.seek(0)
-        return StreamingResponse(
-            output_zip, 
-            media_type="application/zip", 
-            headers={"Content-Disposition": "attachment; filename=gaussians.zip"}
+    try:
+        resp = requests.post(f"{API_BASE_URL}/predict", files=files, timeout=300)
+        resp.raise_for_status()
+        data = resp.json()
+    except Exception as e:
+        return None, f"Backend error: {e}"
+
+    results = data.get("results", [])
+    buf = io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        metas = []
+        for item in results:
+            if "error" in item:
+                metas.append(f"{item.get('filename', '?')}: ERROR {item['error']}")
+                continue
+            ply_bytes = base64.b64decode(item["ply_data"])
+            zf.writestr(item["ply_filename"], ply_bytes)
+            metas.append(
+                f"{item['filename']} -> {item['ply_filename']} "
+                f"({item['width']}x{item['height']}, f={item['focal_length']:.2f})"
+            )
+    buf.seek(0)
+    return buf, "\n".join(metas)
+
+
+with gr.Blocks(title="SHARP View Synthesis") as demo:
+    gr.Markdown(
+        "# SHARP View Synthesis\nUpload image(s) to generate 3D Gaussian PLY files via the backend API."
+    )
+
+    with gr.Tab("Single Image"):
+        in_img = gr.Image(type="filepath", label="Input Image")
+        out_file = gr.File(label="Generated PLY")
+        out_info = gr.Textbox(label="Info")
+        btn = gr.Button("Predict")
+        btn.click(predict_single, inputs=[in_img], outputs=[out_file, out_info])
+
+    with gr.Tab("Batch"):
+        in_imgs = gr.File(
+            file_count="multiple", file_types=["image"], label="Input Images"
         )
+        out_zip = gr.File(label="PLY ZIP")
+        out_info2 = gr.Textbox(label="Info")
+        btn2 = gr.Button("Predict Batch")
+        btn2.click(predict_batch, inputs=[in_imgs], outputs=[out_zip, out_info2])
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # On Hugging Face Spaces, API_BASE_URL must point to your GPU cloud FastAPI server
+    demo.launch(server_name="0.0.0.0", server_port=7860)
